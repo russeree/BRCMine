@@ -1,5 +1,4 @@
 import os
-import time
 import zmq
 import threading
 import requests
@@ -8,17 +7,16 @@ import concurrent.futures  # Ensure this line is here
 import traceback
 
 from bitcoinutils.script import Script
-from bitcoinutils.transactions import Transaction, TxOutput, TxInput
-from bitcoin.core.script import CScript
-from bitcoin.core import lx, b2lx, b2x, x
+from bitcoinutils.transactions import Transaction, TxOutput
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # A global list of txid we RBF'd so we dont bump them again
 rbf_txids = []
+total_p2tr_processed = 0
 
-def is_p2tr_outpint(decoded_script):
+def is_p2tr_outpoint(decoded_script):
     asm_field = decoded_script.get('asm', '')
     if asm_field.startswith('1'):
         return True
@@ -42,7 +40,6 @@ def send_rpc_request(method, params=[]):
     return response.json()['result']
 
 def check_inner_witness(txid):
-    print(txid)
     missing_sigs_tx = []
 
     if txid in rbf_txids:
@@ -63,7 +60,6 @@ def check_inner_witness(txid):
         # Fetch the txid and vout for the input
         input_txid = vin['txid']
         output_index = vin['vout']
-
         # Fetch the raw transaction for the input txid
         raw_input_tx = send_rpc_request("getrawtransaction", [input_txid])
         if not raw_input_tx:
@@ -84,56 +80,27 @@ def check_inner_witness(txid):
             continue
 
         # Check to see if the output to the input is p2tr
-        if is_p2tr_outpint(script):
-            ''' First lets make a change address that we can use an sign for, create inputs and outputs '''
-            #Get a UTXOs ready to bump the TX
-            utxos = send_rpc_request("listunspent")
-            selected_utxos = []
-            change_value = 0
-            # Iterate through unspent transactions
-            for tx in utxos:
-                #amount is less than 1000, add txid and vout to the array
-                if tx['amount'] > .00002000:
-                    selected_utxos.append(TxInput(tx['txid'], tx['vout']))
-                    change_value += tx['amount']
-            if not selected_utxos:
-                return missing_sigs_tx
-            # Next lets get ourselves a change address
-            change_address = send_rpc_request("getnewaddress")
-            change_value *= 100000000
-            # Get the script pubkey
-            address_details = send_rpc_request("validateaddress", [change_address])
-            try:
-                change_txout = TxOutput(int(change_value) - 1777, Script.from_raw(address_details['scriptPubKey']))
-            except Exception as E:
-                print(f'Failed to generate change output with error {E}')
-
-            print(change_txout)
-
+        if is_p2tr_outpoint(script):
             # Decode the [0] index witness script
             txinwitness = vin.get('txinwitness', [])
-
             if len(txinwitness) > 1:
                 # Take the first witness script
                 witness_script = txinwitness[-2]
-
                 # Call the decodescript RPC with the witness script
                 decoded_script = send_rpc_request("decodescript", [witness_script])
                 # data you want to include in OP_RETURN output
-                data = 'Acid Burn - Portland.HODL & D++'  # make sure it is within the allowed byte limit
+                data = 'All your base are belong to us - Portland.HODL & D++'
                 #data = 'Portland.HODL was here.'  # make sure it is within the allowed byte limit
                 data_bytes = data.encode('utf-8')
                 hex_data = data_bytes.hex()
-
                 # construct OP_RETURN output script
                 op_return_script = Script(['OP_RETURN', hex_data])
-                outpoint = TxOutput(0, op_return_script)
+                outpoint = TxOutput(1, op_return_script)
                 # Print the decoded script result
                 if 'OP_CHECKSIG' not in str(decoded_script.get('asm', "")):
                     # Create a TX object
                     py_tx = Transaction.from_raw(raw_tx)
                     print(py_tx)
-
                     # Strip the inputs to only sigless instances
                     tx_inputs = []
                     tx_witness_del = []
@@ -159,8 +126,6 @@ def check_inner_witness(txid):
                     # Add the outputs to the TX - Change + OP_RETURN
                     py_tx.outputs = []
                     py_tx.outputs.append(outpoint)
-                    py_tx.outputs.append(change_txout)
-
                     print(py_tx)
 
                     try:
@@ -173,7 +138,12 @@ def check_inner_witness(txid):
                     print(new_raw_tx)
 
                     ''' add an input to fund the raw transaction '''
-                    new_raw_tx = send_rpc_request("fundrawtransaction", [new_raw_tx])
+                    options = {
+                        "changePosition" : 1,
+                        "include_unsafe" : True,
+                        "fee_rate": 20 # 50 satoshis per vbyte
+                    }
+                    new_raw_tx = send_rpc_request("fundrawtransaction", [new_raw_tx, options])
                     print(new_raw_tx)
 
                     ''' We must sign for that pesky input for the change  '''
@@ -186,7 +156,7 @@ def check_inner_witness(txid):
                     #rbf_txids.append(get_txid)
                     #print(rbf_txids)
 
-                    b_cast = send_rpc_request("sendrawtransaction", [new_raw_tx['hex']])
+                    b_cast = send_rpc_request("sendrawtransaction", [new_raw_tx['hex'], {'maxburnamount' : 1}])
                     print(b_cast)
 
     return missing_sigs_tx
